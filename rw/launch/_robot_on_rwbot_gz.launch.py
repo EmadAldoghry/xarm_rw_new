@@ -35,7 +35,7 @@ def launch_setup(context, *args, **kwargs):
     prefix = LaunchConfiguration('prefix', default='')
     add_gripper = LaunchConfiguration('add_gripper', default=False)
     add_bio_gripper = LaunchConfiguration('add_bio_gripper', default=False)
-    dof = LaunchConfiguration('dof', default=7)
+    dof = LaunchConfiguration('dof', default=6)
     robot_type = LaunchConfiguration('robot_type', default='xarm')
     show_rviz = LaunchConfiguration('show_rviz', default=False)
 
@@ -108,25 +108,20 @@ def launch_setup(context, *args, **kwargs):
     )
 
     # Load controllers
-    controllers = [
-        'joint_state_broadcaster',
-        '{}{}_traj_controller'.format(prefix.perform(context), xarm_type)
-    ]
-    if robot_type.perform(context) != 'lite' and add_gripper.perform(context) in ('True', 'true'):
-        controllers.append('{}{}_gripper_traj_controller'.format(prefix.perform(context), robot_type.perform(context)))
-    elif robot_type.perform(context) != 'lite' and add_bio_gripper.perform(context) in ('True', 'true'):
-        controllers.append('{}bio_gripper_traj_controller'.format(prefix.perform(context)))
+    controllers_yaml_path = os.path.join(get_package_share_directory('rw'), 'config', 'controllers.yaml')
+    with open(controllers_yaml_path, 'r') as file:
+        controllers_data = yaml.safe_load(file)
+    controllers_to_spawn = controllers_data.get('controller_names', [])
+    controllers_to_spawn.insert(0, 'joint_state_broadcaster')
     
-    controller_nodes = []
-    for controller in controllers:
-        controller_nodes.append(Node(
+    controller_spawner_nodes = []
+    for controller in controllers_to_spawn:
+        controller_spawner_nodes.append(Node(
             package='controller_manager',
             executable='spawner',
             output='screen',
-            arguments=[
-                controller,
-                '--controller-manager', '{}/controller_manager'.format(ros_namespace)
-            ],
+            # Use the correct argument for ROS 2 Jazzy/Humble/Iron
+            arguments=[controller, '--controller-manager-timeout', '30'], 
             parameters=[{'use_sim_time': True}],
         ))
 
@@ -154,12 +149,13 @@ def launch_setup(context, *args, **kwargs):
         robot_state_publisher_node
     ]
 
-    if len(controller_nodes) > 0:
+    # Spawn controllers after the robot is spawned in Gazebo
+    if len(controller_spawner_nodes) > 0:
         actions_to_return.append(
             RegisterEventHandler(
                 event_handler=OnProcessExit(
                     target_action=gazebo_spawn_entity_node,
-                    on_exit=controller_nodes,
+                    on_exit=controller_spawner_nodes,
                 )
             )
         )

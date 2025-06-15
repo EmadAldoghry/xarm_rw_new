@@ -21,7 +21,7 @@ from geometry_msgs.msg import TransformStamped
 
 class GroundPlaneSegmenterNode(Node):
     def __init__(self):
-        super().__init__('ground_plane_segmenter_tf_node') # Renamed slightly as saving is removed
+        super().__init__('ground_plane_segmenter_node') # Renamed slightly as saving is removed
 
         # Target frame for all processing and output
         self.target_frame = "base_link"
@@ -42,18 +42,18 @@ class GroundPlaneSegmenterNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Subscriber
+        # Subscribe to the gated topic, not the raw camera topic
         self.create_subscription(
             PointCloud2,
-            '/camera2/points', # Assuming this is the correct topic for your lidar
+            'gated_point_cloud', 
             self.pointcloud_callback,
             qos_profile_sensor_data
         )
 
         # Publishers (will publish in target_frame)
-        self.inlier_pub = self.create_publisher(PointCloud2, 'ground_plane_points', 10)      # Red
-        self.outlier_pub = self.create_publisher(PointCloud2, 'non_ground_points', 10)       # Green
-        self.projected_pub = self.create_publisher(PointCloud2, 'projected_non_ground_points', 10) # Orange
+        self.inlier_pub = self.create_publisher(PointCloud2, 'ground_plane_points', 10)
+        self.outlier_pub = self.create_publisher(PointCloud2, 'non_ground_points', 10)
+        self.projected_pub = self.create_publisher(PointCloud2, 'projected_non_ground_points', 10)
 
         # XYZRGB PointFields (used for ROS publishing)
         self.xyzrgb_point_fields = [
@@ -98,13 +98,24 @@ class GroundPlaneSegmenterNode(Node):
         current_stamp = cloud_msg.header.stamp
         source_frame = cloud_msg.header.frame_id
 
-        # --- 1. Get Transform ---
+        # --- 1. Get Transform (with waiting) ---
         try:
+            # FIX: Wait until the transform is actually available.
+            # This is crucial for nodes that start up at the same time.
+            if not self.tf_buffer.can_transform(
+                self.target_frame, source_frame, current_stamp, timeout=rclpy.duration.Duration(seconds=1.0)
+            ):
+                self.get_logger().warn(
+                    f"Transform from '{source_frame}' to '{self.target_frame}' not available yet. Waiting..."
+                )
+                return
+
             transform: TransformStamped = self.tf_buffer.lookup_transform(
-                self.target_frame, source_frame, current_stamp, timeout=Duration(seconds=0.1)
+                self.target_frame, source_frame, current_stamp
             )
             self.get_logger().debug(f"Successfully found transform from {source_frame} to {self.target_frame}")
         except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            # This block will now be less likely to be hit, but is still good for handling other errors.
             self.get_logger().warn(
                 f"Could not get transform from '{source_frame}' to '{self.target_frame}' at time {current_stamp.sec}.{current_stamp.nanosec}: {e}. Skipping message."
             )

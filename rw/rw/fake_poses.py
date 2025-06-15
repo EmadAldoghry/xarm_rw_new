@@ -38,7 +38,7 @@ class PathGeneratorNode(Node):
             x=self.target_orientation_quat[0],
             y=self.target_orientation_quat[1],
             z=self.target_orientation_quat[2],
-            w=0.0
+            w=self.target_orientation_quat[3]
         )
         self.output_frame_id = "base_link"
 

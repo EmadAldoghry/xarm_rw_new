@@ -2,148 +2,147 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseArray, Pose
-from xarm_msgs.srv import PlanPose, PlanSingleStraight, PlanExec
+from xarm_msgs.srv import PlanSingleStraight, PlanExec
+from rw.srv import SetProcessing  # Import our new service
 import sys
 import time
+from collections import deque
 
-# Service names provided by xarm_planner_node (adjust if namespace/prefix is used)
-POSE_PLAN_SERVICE = '/xarm_pose_plan'
-JOINT_PLAN_SERVICE = '/xarm_joint_plan'  # Not used here, but good to know
+# Service and topic names
 STRAIGHT_PLAN_SERVICE = '/xarm_straight_plan'
 EXEC_PLAN_SERVICE = '/xarm_exec_plan'
+PERCEPTION_SERVICE = 'set_perception_processing'
 POSE_ARRAY_TOPIC = '/arm_path_poses'
 
-
 class CartesianPlannerClient(Node):
-
     def __init__(self):
-        super().__init__('xarm6_cartesian_planner_client')
+        super().__init__('cartesian_planner_client')
         self.get_logger().info("Initializing Cartesian Planner Client...")
+        
+        self.callback_group = ReentrantCallbackGroup()
+        self.is_initialized = False
+        self._is_executing = False
+        self.path_queue = deque()
 
-        # Create Service Clients
-        self.pose_plan_client = self.create_client(PlanPose, POSE_PLAN_SERVICE)
-        self.straight_plan_client = self.create_client(PlanSingleStraight, STRAIGHT_PLAN_SERVICE)
-        self.exec_plan_client = self.create_client(PlanExec, EXEC_PLAN_SERVICE)
+        self.perception_client = self.create_client(SetProcessing, PERCEPTION_SERVICE, callback_group=self.callback_group)
+        self.straight_plan_client = self.create_client(PlanSingleStraight, STRAIGHT_PLAN_SERVICE, callback_group=self.callback_group)
+        self.exec_plan_client = self.create_client(PlanExec, EXEC_PLAN_SERVICE, callback_group=self.callback_group)
 
-        # Wait for services to be available
-        if not self.straight_plan_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error(f'Service {STRAIGHT_PLAN_SERVICE} not available.')
-            rclpy.shutdown()
-            sys.exit(1)
-        if not self.exec_plan_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error(f'Service {EXEC_PLAN_SERVICE} not available.')
-            rclpy.shutdown()
-            sys.exit(1)
+        for client, name in [(self.straight_plan_client, STRAIGHT_PLAN_SERVICE),
+                             (self.exec_plan_client, EXEC_PLAN_SERVICE),
+                             (self.perception_client, PERCEPTION_SERVICE)]:
+            if not client.wait_for_service(timeout_sec=10.0):
+                self.get_logger().error(f'Service "{name}" not available. Shutting down.')
+                return
 
-        self.get_logger().info("Service clients created and ready.")
+        self.get_logger().info("All required services are available.")
 
-        # Subscribe to PoseArray topic
-        self.pose_array_sub = self.create_subscription(PoseArray, POSE_ARRAY_TOPIC, self.pose_array_callback, 10)
-        self.poses_received = False
-        self.pose_array = []
+        self.pose_array_sub = self.create_subscription(
+            PoseArray, POSE_ARRAY_TOPIC, self.pose_array_callback, 10, callback_group=self.callback_group
+        )
+        
+        self.is_initialized = True
+        self.get_logger().info(f"Ready and waiting for paths on '{POSE_ARRAY_TOPIC}'.")
 
-    def pose_array_callback(self, msg):
-        self.pose_array = msg.poses
-        self.poses_received = True
-        self.get_logger().info(f"Received {len(self.pose_array)} poses from topic '{POSE_ARRAY_TOPIC}'")
+    def set_perception(self, state: bool):
+        req = SetProcessing.Request(data=state)
+        self.get_logger().info(f"Requesting to {'ENABLE' if state else 'PAUSE'} perception...")
+        future = self.perception_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+        if future.done() and future.result():
+            self.get_logger().info(f"Perception gate response: {future.result().message}")
+        else:
+            self.get_logger().error("Failed to call perception gate service.")
 
-    def plan_and_execute_straight(self, target_pose, wait_for_execution=True):
-        self.get_logger().info(f"Planning straight path to: {target_pose}")
+    def pose_array_callback(self, msg: PoseArray):
+        if self._is_executing:
+            self.get_logger().warn("Currently executing a path. Skipping new PoseArray.")
+            return
+        if not msg.poses:
+            self.get_logger().warn("Received an empty PoseArray message.")
+            return
+            
+        self._is_executing = True
+        self.set_perception(False)
+        self.get_logger().info(f"Received path with {len(msg.poses)} poses. Starting sequence.")
+        
+        start_pose = Pose()
+        start_pose.position.x, start_pose.position.y, start_pose.position.z = 0.28, 0.0, 0.25
+        start_pose.orientation.x, start_pose.orientation.y, start_pose.orientation.z, start_pose.orientation.w = 1.0, 0.0, 0.0, 0.0
+        
+        home_pose = Pose()
+        home_pose.position.x, home_pose.position.y, home_pose.position.z = 0.2, 0.0, 0.4
+        home_pose.orientation.x, home_pose.orientation.y, home_pose.orientation.z, home_pose.orientation.w = 1.0, 0.0, 0.0, 0.0
 
-        plan_req = PlanSingleStraight.Request()
-        plan_req.target = target_pose
+        self.path_queue = deque([start_pose] + msg.poses + [home_pose])
+        self.process_next_pose()
 
+    def process_next_pose(self):
+        if not self.path_queue:
+            self.get_logger().info("--- Path execution complete. ---")
+            self.finish_sequence()
+            return
+
+        target_pose = self.path_queue.popleft()
+        self.get_logger().info(f"Planning for next waypoint ({len(self.path_queue)} remaining)...")
+        plan_req = PlanSingleStraight.Request(target=target_pose)
         plan_future = self.straight_plan_client.call_async(plan_req)
-        rclpy.spin_until_future_complete(self, plan_future)
+        plan_future.add_done_callback(self.plan_done_callback)
 
-        if plan_future.result() is None:
-            self.get_logger().error(f'Exception while calling service {STRAIGHT_PLAN_SERVICE}: {plan_future.exception()}')
-            return False
+    def plan_done_callback(self, plan_future):
+        try:
+            plan_result = plan_future.result()
+            if not plan_result.success:
+                self.get_logger().error("Cartesian planning failed! Aborting sequence.")
+                self.finish_sequence()
+                return
+        except Exception as e:
+            self.get_logger().error(f"Exception during planning: {e}. Aborting sequence.")
+            self.finish_sequence()
+            return
 
-        plan_res = plan_future.result()
-        if not plan_res.success:
-            self.get_logger().error("Cartesian planning failed!")
-            return False
-
-        self.get_logger().info("Cartesian planning successful.")
-
-        exec_req = PlanExec.Request()
-        exec_req.wait = wait_for_execution
-
+        self.get_logger().info("Planning successful. Executing trajectory...")
+        exec_req = PlanExec.Request(wait=True)
         exec_future = self.exec_plan_client.call_async(exec_req)
-        rclpy.spin_until_future_complete(self, exec_future)
+        exec_future.add_done_callback(self.exec_done_callback)
 
-        if exec_future.result() is None:
-            self.get_logger().error(f'Exception while calling service {EXEC_PLAN_SERVICE}: {exec_future.exception()}')
-            return False
+    def exec_done_callback(self, exec_future):
+        try:
+            exec_result = exec_future.result()
+            if not exec_result.success:
+                self.get_logger().error("Trajectory execution failed! Aborting sequence.")
+                self.finish_sequence()
+                return
+        except Exception as e:
+            self.get_logger().error(f"Exception during execution: {e}. Aborting sequence.")
+            self.finish_sequence()
+            return
 
-        exec_res = exec_future.result()
-        if not exec_res.success:
-            self.get_logger().error("Plan execution failed!")
-            return False
-
-        self.get_logger().info("Plan execution successful.")
-        return True
-
+        self.get_logger().info("Waypoint execution successful.")
+        time.sleep(0.5) 
+        self.process_next_pose()
+        
+    def finish_sequence(self):
+        self.set_perception(True)
+        self.path_queue.clear()
+        self._is_executing = False
 
 def main(args=None):
     rclpy.init(args=args)
-
     planner_client_node = CartesianPlannerClient()
-
-    try:
-        # Wait until PoseArray is received
-        planner_client_node.get_logger().info("Waiting for PoseArray message...")
-        while not planner_client_node.poses_received:
-            rclpy.spin_once(planner_client_node)
-
-        time.sleep(1.0)  # Optional: Let planner settle
-
-        # Define Start Pose (e.g., Home position)
-        start_pose = Pose()
-        start_pose.position.x = 0.4
-        start_pose.position.y = 0.0
-        start_pose.position.z = 0.2
-        start_pose.orientation.x = 1.0
-        start_pose.orientation.y = 0.0
-        start_pose.orientation.z = 0.0
-        start_pose.orientation.w = 0.0
-
-        # Define End Pose (e.g., Safe park position)
-        end_pose = Pose()
-        end_pose.position.x = 0.3
-        end_pose.position.y = 0.1
-        end_pose.position.z = 0.3
-        end_pose.orientation.x = 1.0
-        end_pose.orientation.y = 0.0
-        end_pose.orientation.z = 0.0
-        end_pose.orientation.w = 0.0
-
-        # Combine full sequence: start → poses → end
-        full_pose_sequence = [start_pose] + planner_client_node.pose_array + [end_pose]
-
-        total = len(full_pose_sequence)
-        for idx, pose in enumerate(full_pose_sequence):
-            pose_number = idx + 1
-            planner_client_node.get_logger().info(f"Attempting to reach Pose {pose_number}/{total}...")
-            success = planner_client_node.plan_and_execute_straight(pose)
-
-            if success:
-                planner_client_node.get_logger().info(f"Successfully reached Pose {pose_number}")
-                time.sleep(1.0)
-            else:
-                planner_client_node.get_logger().warn(f"Skipping Pose {pose_number} due to planning/execution failure.")
-
-        planner_client_node.get_logger().info("Completed sequence (with skips if any).")
-
-    except Exception as e:
-        planner_client_node.get_logger().error(f"An exception occurred during execution: {e}")
-    finally:
-        planner_client_node.get_logger().info("Shutting down node.")
+    if not planner_client_node.is_initialized:
+        print("[ERROR] CartesianPlannerClient failed to initialize. Shutting down.", file=sys.stderr)
+    else:
+        try:
+            rclpy.spin(planner_client_node)
+        except KeyboardInterrupt:
+            planner_client_node.get_logger().info("Keyboard interrupt, shutting down.")
+    
+    if rclpy.ok():
         planner_client_node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
