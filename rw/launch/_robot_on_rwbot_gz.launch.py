@@ -63,7 +63,7 @@ def launch_setup(context, *args, **kwargs):
     )
 
     # gazebo launch
-    xarm_gazebo_world = PathJoinSubstitution([FindPackageShare('rw'), 'worlds', 'cracked_road_02.world'])
+    xarm_gazebo_world = PathJoinSubstitution([FindPackageShare('rw'), 'worlds', 'pipeline_generated.world'])
     gazebo_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution([FindPackageShare('ros_gz_sim'), 'launch', 'gz_sim.launch.py'])),
         launch_arguments={
@@ -79,7 +79,7 @@ def launch_setup(context, *args, **kwargs):
         arguments=[
             '-topic', 'robot_description',
             '-name', 'rwbot_with_xarm',
-            "-x", '-0.88', "-y", '-2.1', "-z", '0.31', "-Y", '-1.52'
+            "-x", '38.70', "-y", '-4.74', "-z", '0.21', "-Y", '0.0'
         ],
         parameters=[{'use_sim_time': True}],
     )

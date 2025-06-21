@@ -28,8 +28,8 @@ def launch_setup(context, *args, **kwargs):
     hw_ns = LaunchConfiguration('hw_ns', default='xarm')
     limited = LaunchConfiguration('limited', default=True)
     attach_to = LaunchConfiguration('attach_to', default='base_link')
-    attach_xyz = LaunchConfiguration('attach_xyz', default='"-0.039 0.0 0.091"')
-    attach_rpy = LaunchConfiguration('attach_rpy', default='"0 0 0"')
+    attach_xyz = LaunchConfiguration('attach_xyz', default='"0.055 0.0 0.091"')
+    attach_rpy = LaunchConfiguration('attach_rpy', default='"0 0 3.14"')
 
     add_gripper = LaunchConfiguration('add_gripper', default=False)
     add_vacuum_gripper = LaunchConfiguration('add_vacuum_gripper', default=False)
@@ -188,13 +188,24 @@ def generate_launch_description():
             "/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist",
             "/odom@nav_msgs/msg/Odometry@gz.msgs.Odometry",
             "/joint_states@sensor_msgs/msg/JointState@gz.msgs.Model",
+            
+            # Front Camera
+            "/camera/image@sensor_msgs/msg/Image[gz.msgs.Image",
             "/camera/camera_info@sensor_msgs/msg/CameraInfo@gz.msgs.CameraInfo",
+            "/camera/depth_image@sensor_msgs/msg/Image@gz.msgs.Image",
+            "/camera/points@sensor_msgs/msg/PointCloud2@gz.msgs.PointCloudPacked",
+            
+            # Lidar and IMU
             "scan@sensor_msgs/msg/LaserScan@gz.msgs.LaserScan",
             "/scan/points@sensor_msgs/msg/PointCloud2@gz.msgs.PointCloudPacked",
             "imu@sensor_msgs/msg/Imu@gz.msgs.IMU",
-            #"/navsat@sensor_msgs/msg/NavSatFix@gz.msgs.NavSat",
-            "/camera/depth_image@sensor_msgs/msg/Image@gz.msgs.Image",
-            "/camera/points@sensor_msgs/msg/PointCloud2@gz.msgs.PointCloudPacked",
+            
+            # --- Rear Camera (camera2) ---
+            "/camera2/image@sensor_msgs/msg/Image[gz.msgs.Image", # You might have added this already
+            
+            # --- ADD THIS LINE FOR THE REAR CAMERA INFO ---
+            "/camera2/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo",
+            
             "/camera2/depth_image@sensor_msgs/msg/Image@gz.msgs.Image",
             "/camera2/points@sensor_msgs/msg/PointCloud2@gz.msgs.PointCloudPacked",
         ],

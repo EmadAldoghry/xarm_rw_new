@@ -1,3 +1,5 @@
+# FILE: rw/rw/fake_poses.py
+
 #!/usr/bin/env python3
 
 import rclpy
@@ -10,36 +12,35 @@ import numpy as np
 from scipy.spatial import KDTree
 import tf_transformations
 import math
-import open3d as o3d  # For voxel downsampling
-
+import open3d as o3d
 
 class PathGeneratorNode(Node):
     def __init__(self):
         super().__init__('path_generator_publisher_node')
 
-        # --- Parameters ---
         self.declare_parameter('input_topic', '/projected_non_ground_points')
         self.declare_parameter('output_topic', '/arm_path_poses')
-        self.declare_parameter('z_offset', 0.025)
+        # <<< FIX 1: Increase the Z-offset to a safer height
+        self.declare_parameter('z_offset', 0.15) # From 2.5cm to 15cm
         self.declare_parameter('voxel_size', 0.02)
+        # <<< FIX 2: Add a parameter to filter points too close to the robot
+        self.declare_parameter('min_distance_from_base', 0.25) # Min 25cm from robot base
+        self.declare_parameter('target_roll_deg', 180.0)
+        self.declare_parameter('target_pitch_deg', 0.0)
+        self.declare_parameter('target_yaw_deg', 0.0)
 
         self.input_topic = self.get_parameter('input_topic').value
         self.output_topic = self.get_parameter('output_topic').value
         self.z_offset = self.get_parameter('z_offset').value
         self.voxel_size = self.get_parameter('voxel_size').value
+        self.min_dist = self.get_parameter('min_distance_from_base').value
+        
+        target_roll = math.radians(self.get_parameter('target_roll_deg').value)
+        target_pitch = math.radians(self.get_parameter('target_pitch_deg').value)
+        target_yaw = math.radians(self.get_parameter('target_yaw_deg').value)
 
-        self.target_roll = math.pi
-        self.target_pitch = 0.0
-        self.target_yaw = 0.0
-        self.target_orientation_quat = tf_transformations.quaternion_from_euler(
-            self.target_roll, self.target_pitch, self.target_yaw
-        )
-        self.target_orientation = Quaternion(
-            x=self.target_orientation_quat[0],
-            y=self.target_orientation_quat[1],
-            z=self.target_orientation_quat[2],
-            w=0.0
-        )
+        q = tf_transformations.quaternion_from_euler(target_roll, target_pitch, target_yaw)
+        self.target_orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
         self.output_frame_id = "base_link"
 
         self._is_processing = False
@@ -63,14 +64,11 @@ class PathGeneratorNode(Node):
         )
 
         self.get_logger().info("PathGeneratorNode initialized.")
-        self.get_logger().info(f"Subscribed to: {self.input_topic}")
         self.get_logger().info(f"Publishing to: {self.output_topic} (Frame: {self.output_frame_id})")
-        self.get_logger().info(f"Z-offset: {self.z_offset}, Voxel size: {self.voxel_size}")
-        self.get_logger().info(f"Fixed orientation RPY: ({self.target_roll:.2f}, {self.target_pitch:.2f}, {self.target_yaw:.2f})")
+        self.get_logger().info(f"Z-offset: {self.z_offset}, Min distance: {self.min_dist}")
 
     def pointcloud_callback(self, cloud_msg: PointCloud2):
         if self._is_processing:
-            self.get_logger().warn("Still processing previous cloud. Skipping new message.")
             return
 
         self._is_processing = True
@@ -79,17 +77,20 @@ class PathGeneratorNode(Node):
             points_list = [[x, y, z] for x, y, z in points_generator]
 
             if not points_list:
-                self.get_logger().warn("Received empty point cloud.")
                 return
 
             points_np = np.array(points_list, dtype=np.float32)
             points_np = points_np[np.all(np.isfinite(points_np), axis=1)]
-
+            
+            # <<< FIX 2: Filter points that are too close to the robot's base (0,0,0 in base_link frame)
+            distances = np.linalg.norm(points_np[:, :2], axis=1) # Check only XY distance
+            keep_mask = distances >= self.min_dist
+            points_np = points_np[keep_mask]
+            
             if points_np.shape[0] < 2:
-                self.get_logger().warn("Not enough valid points for path generation.")
+                self.get_logger().warn("Not enough valid points after filtering for path generation.")
                 return
 
-            # --- Downsample using voxel grid ---
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(points_np)
             pcd_down = pcd.voxel_down_sample(voxel_size=self.voxel_size)
@@ -99,35 +100,35 @@ class PathGeneratorNode(Node):
                 self.get_logger().warn(f"Downsampled point cloud too small ({downsampled_points.shape[0]} points).")
                 return
 
-            self.get_logger().info(f"Downsampled from {points_np.shape[0]} to {downsampled_points.shape[0]} points.")
+            # --- Sort points by distance from one end to the other ---
+            # Find the two points that are farthest apart to define the start and end of the path
+            from scipy.spatial.distance import pdist, squareform
+            dist_matrix = squareform(pdist(downsampled_points, 'euclidean'))
+            start_idx, end_idx = np.unravel_index(np.argmax(dist_matrix), dist_matrix.shape)
 
-            # --- Nearest Neighbor Path Generation ---
-            num_points = len(downsampled_points)
-            distances_from_origin = np.linalg.norm(downsampled_points, axis=1)
-            start_index = np.argmax(distances_from_origin)
-
+            # Use KDTree for efficient nearest neighbor search
             kdtree = KDTree(downsampled_points)
-            visited = np.zeros(num_points, dtype=bool)
-            path_indices = [start_index]
-            visited[start_index] = True
-            current_index = start_index
+            path_indices = [start_idx]
+            visited = {start_idx}
+            current_index = start_idx
 
-            for _ in range(num_points - 1):
-                distances, indices = kdtree.query(downsampled_points[current_index], k=num_points)
-                next_index = -1
+            while len(path_indices) < len(downsampled_points):
+                _, indices = kdtree.query(downsampled_points[current_index], k=len(downsampled_points))
+                found_next = False
                 for idx in indices:
-                    if 0 <= idx < num_points and not visited[idx]:
-                        next_index = idx
+                    if idx not in visited:
+                        path_indices.append(idx)
+                        visited.add(idx)
+                        current_index = idx
+                        found_next = True
                         break
-                if next_index == -1:
-                    self.get_logger().warn("Could not find next unvisited neighbor. Ending path early.")
-                    break
-                path_indices.append(next_index)
-                visited[next_index] = True
-                current_index = next_index
+                if not found_next:
+                    self.get_logger().warn("Could not find next unvisited neighbor. Path may be incomplete.")
+                    break # Break if no unvisited neighbor is found
 
             sorted_points = downsampled_points[path_indices]
-            sorted_points[:, 2] += self.z_offset
+            # <<< FIX 1: Apply the Z-offset
+            sorted_points[:, 2] = self.z_offset
 
             pose_array_msg = PoseArray()
             pose_array_msg.header.stamp = self.get_clock().now().to_msg()
@@ -143,7 +144,7 @@ class PathGeneratorNode(Node):
             self.get_logger().info(f"Published PoseArray with {len(pose_array_msg.poses)} poses.")
 
         except Exception as e:
-            self.get_logger().error(f"Error during processing: {e}", exc_info=True)
+            self.get_logger().error(f"Error during processing: {e}")
         finally:
             self._is_processing = False
 
@@ -158,7 +159,6 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

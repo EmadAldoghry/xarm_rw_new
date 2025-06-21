@@ -30,9 +30,20 @@ setup(
 
         (os.path.join('share', package_name, 'srdf'),
          glob(os.path.join('srdf', '*'))),
-        # World files
+        # --- World files ---
+        # Install files directly under 'worlds/' (e.g., empty.sdf, home.sdf, etc.)
+        # We filter to ensure we only pick up files, not the subdirectory itself.
         (os.path.join('share', package_name, 'worlds'),
-         glob(os.path.join('worlds', '*'))),
+         [f for f in glob(os.path.join('worlds', '*')) if os.path.isfile(f)]),
+
+        # Install the contents of 'worlds/pipeline_road_model/'
+        # into 'share/rw/worlds/pipeline_road_model/'
+        (os.path.join('share', package_name, 'worlds', 'pipeline_road_model'),
+         glob(os.path.join('worlds', 'pipeline_road_model', '*'))),
+        # --- End World files ---
+
+        (os.path.join('share', package_name, 'maps'),
+         glob(os.path.join('maps', '*'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
